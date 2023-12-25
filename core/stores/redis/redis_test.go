@@ -16,6 +16,25 @@ import (
 	"github.com/zeromicro/go-zero/core/stringx"
 )
 
+type myHook struct {
+	red.Hook
+	includePing bool
+}
+
+var _ red.Hook = myHook{}
+
+func (m myHook) BeforeProcess(ctx context.Context, cmd red.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (m myHook) AfterProcess(ctx context.Context, cmd red.Cmder) error {
+	// skip ping cmd
+	if cmd.Name() == "ping" && !m.includePing {
+		return nil
+	}
+	return errors.New("hook error")
+}
+
 func TestNewRedis(t *testing.T) {
 	r1, err := miniredis.Run()
 	assert.NoError(t, err)
@@ -126,6 +145,31 @@ func TestNewRedis(t *testing.T) {
 	}
 }
 
+func TestRedis_NonBlock(t *testing.T) {
+	logx.Disable()
+
+	t.Run("nonBlock true", func(t *testing.T) {
+		s := miniredis.RunT(t)
+		// use hook to simulate redis ping error
+		_, err := NewRedis(RedisConf{
+			Host:     s.Addr(),
+			NonBlock: true,
+			Type:     NodeType,
+		}, withHook(myHook{includePing: true}))
+		assert.NoError(t, err)
+	})
+
+	t.Run("nonBlock false", func(t *testing.T) {
+		s := miniredis.RunT(t)
+		_, err := NewRedis(RedisConf{
+			Host:     s.Addr(),
+			NonBlock: false,
+			Type:     NodeType,
+		}, withHook(myHook{includePing: true}))
+		assert.ErrorContains(t, err, "redis connect error")
+	})
+}
+
 func TestRedis_Decr(t *testing.T) {
 	runOnRedis(t, func(client *Redis) {
 		_, err := New(client.Addr, badType()).Decr("a")
@@ -180,6 +224,36 @@ func TestRedisTLS_Exists(t *testing.T) {
 	})
 }
 
+func TestRedis_ExistsMany(t *testing.T) {
+	runOnRedis(t, func(client *Redis) {
+		// Attempt to create a new Redis instance with an incorrect type and call ExistsMany
+		_, err := New(client.Addr, badType()).ExistsMany("key1", "key2")
+		assert.NotNil(t, err)
+
+		// Check if key1 and key2 exist, expecting that they do not
+		val, err := client.ExistsMany("key1", "key2")
+		assert.Nil(t, err)
+		assert.Equal(t, int64(0), val)
+
+		// Set the value for key1 and check if key1 exists
+		assert.Nil(t, client.Set("key1", "value1"))
+		val, err = client.ExistsMany("key1")
+		assert.Nil(t, err)
+		assert.Equal(t, int64(1), val)
+
+		// Set the value for key2 and check if key1 and key2 exist
+		assert.Nil(t, client.Set("key2", "value2"))
+		val, err = client.ExistsMany("key1", "key2")
+		assert.Nil(t, err)
+		assert.Equal(t, int64(2), val)
+
+		// Check if key1, key2, and a non-existent key3 exist, expecting that key1 and key2 do
+		val, err = client.ExistsMany("key1", "key2", "key3")
+		assert.Nil(t, err)
+		assert.Equal(t, int64(2), val)
+	})
+}
+
 func TestRedis_Eval(t *testing.T) {
 	runOnRedis(t, func(client *Redis) {
 		_, err := New(client.Addr, badType()).Eval(`redis.call("EXISTS", KEYS[1])`, []string{"notexist"})
@@ -191,6 +265,24 @@ func TestRedis_Eval(t *testing.T) {
 		_, err = client.Eval(`redis.call("EXISTS", KEYS[1])`, []string{"key1"})
 		assert.Equal(t, Nil, err)
 		val, err := client.Eval(`return redis.call("EXISTS", KEYS[1])`, []string{"key1"})
+		assert.Nil(t, err)
+		assert.Equal(t, int64(1), val)
+	})
+}
+
+func TestRedis_ScriptRun(t *testing.T) {
+	runOnRedis(t, func(client *Redis) {
+		sc := NewScript(`redis.call("EXISTS", KEYS[1])`)
+		sc2 := NewScript(`return redis.call("EXISTS", KEYS[1])`)
+		_, err := New(client.Addr, badType()).ScriptRun(sc, []string{"notexist"})
+		assert.NotNil(t, err)
+		_, err = client.ScriptRun(sc, []string{"notexist"})
+		assert.Equal(t, Nil, err)
+		err = client.Set("key1", "value1")
+		assert.Nil(t, err)
+		_, err = client.ScriptRun(sc, []string{"key1"})
+		assert.Equal(t, Nil, err)
+		val, err := client.ScriptRun(sc2, []string{"key1"})
 		assert.Nil(t, err)
 		assert.Equal(t, int64(1), val)
 	})
@@ -507,6 +599,14 @@ func TestRedis_List(t *testing.T) {
 			vals, err = client.Lrange("key", 0, 10)
 			assert.Nil(t, err)
 			assert.EqualValues(t, []string{"value2", "value3"}, vals)
+			vals, err = client.LpopCount("key", 2)
+			assert.Nil(t, err)
+			assert.EqualValues(t, []string{"value2", "value3"}, vals)
+			_, err = client.Lpush("key", "value1", "value2")
+			assert.Nil(t, err)
+			vals, err = client.RpopCount("key", 4)
+			assert.Nil(t, err)
+			assert.EqualValues(t, []string{"value1", "value2"}, vals)
 		})
 	})
 
@@ -522,6 +622,34 @@ func TestRedis_List(t *testing.T) {
 			assert.Error(t, err)
 
 			_, err = client.Rpush("key", "value3", "value4")
+			assert.Error(t, err)
+
+			_, err = client.LpopCount("key", 2)
+			assert.Error(t, err)
+
+			_, err = client.RpopCount("key", 2)
+			assert.Error(t, err)
+		})
+	})
+	t.Run("list redis type error", func(t *testing.T) {
+		runOnRedisWithError(t, func(client *Redis) {
+			client.Type = "nil"
+			_, err := client.Llen("key")
+			assert.Error(t, err)
+
+			_, err = client.Lpush("key", "value1", "value2")
+			assert.Error(t, err)
+
+			_, err = client.Lrem("key", 2, "value1")
+			assert.Error(t, err)
+
+			_, err = client.Rpush("key", "value3", "value4")
+			assert.Error(t, err)
+
+			_, err = client.LpopCount("key", 2)
+			assert.Error(t, err)
+
+			_, err = client.RpopCount("key", 2)
 			assert.Error(t, err)
 		})
 	})
@@ -1761,21 +1889,7 @@ func TestRedis_WithPass(t *testing.T) {
 func runOnRedis(t *testing.T, fn func(client *Redis)) {
 	logx.Disable()
 
-	s, err := miniredis.Run()
-	assert.Nil(t, err)
-	defer func() {
-		client, err := clientManager.GetResource(s.Addr(), func() (io.Closer, error) {
-			return nil, errors.New("should already exist")
-		})
-		if err != nil {
-			t.Error(err)
-		}
-
-		if client != nil {
-			_ = client.Close()
-		}
-	}()
-
+	s := miniredis.RunT(t)
 	fn(MustNewRedis(RedisConf{
 		Host: s.Addr(),
 		Type: NodeType,
@@ -1785,21 +1899,7 @@ func runOnRedis(t *testing.T, fn func(client *Redis)) {
 func runOnRedisWithError(t *testing.T, fn func(client *Redis)) {
 	logx.Disable()
 
-	s, err := miniredis.Run()
-	assert.NoError(t, err)
-	defer func() {
-		client, err := clientManager.GetResource(s.Addr(), func() (io.Closer, error) {
-			return nil, errors.New("should already exist")
-		})
-		if err != nil {
-			t.Error(err)
-		}
-
-		if client != nil {
-			_ = client.Close()
-		}
-	}()
-
+	s := miniredis.RunT(t)
 	s.SetError("mock error")
 	fn(New(s.Addr()))
 }
